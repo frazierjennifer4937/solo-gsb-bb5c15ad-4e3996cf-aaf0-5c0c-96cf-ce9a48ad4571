@@ -25,6 +25,9 @@ const SAMPLE_ORDERS = [
 const EMPTY_PART = { name: '', width: '', height: '', quantity: 1 };
 const emptyOrder = (i) => ({ orderNo: '', parts: [{ ...EMPTY_PART }] });
 
+// 损坏件三元身份：订单号 + 零件名 + 件号（跨订单同名零件互不影响）
+const itemKey = (order, part, index) => JSON.stringify([order, part, index]);
+
 export default function App() {
   const [boardWidth, setBoardWidth] = useState(String(SAMPLE_BOARD.boardWidth));
   const [boardHeight, setBoardHeight] = useState(String(SAMPLE_BOARD.boardHeight));
@@ -37,6 +40,11 @@ export default function App() {
   const [result, setResult] = useState(null);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+  // 缺件补切：选中的损坏件（Set of itemKey）、补切结果与状态
+  const [selected, setSelected] = useState(new Set());
+  const [recut, setRecut] = useState(null);
+  const [recutError, setRecutError] = useState('');
+  const [recutLoading, setRecutLoading] = useState(false);
 
   // ---- 订单 / 零件行编辑 ----
   const updateOrder = (oi, key, value) => {
@@ -62,6 +70,12 @@ export default function App() {
     }));
   };
 
+  const resetRecut = () => {
+    setSelected(new Set());
+    setRecut(null);
+    setRecutError('');
+  };
+
   const loadSample = () => {
     setBoardWidth(String(SAMPLE_BOARD.boardWidth));
     setBoardHeight(String(SAMPLE_BOARD.boardHeight));
@@ -70,32 +84,36 @@ export default function App() {
     setOrders(SAMPLE_ORDERS.map((o) => ({ orderNo: o.orderNo, parts: o.parts.map((p) => ({ ...p })) })));
     setResult(null);
     setError('');
+    resetRecut();
   };
+
+  const currentPayload = () => ({
+    boardWidth: Number(boardWidth),
+    boardHeight: Number(boardHeight),
+    kerf: kerf === '' ? 0 : Number(kerf),
+    boardPrice: boardPrice === '' ? 0 : Number(boardPrice),
+    orders: orders.map((o) => ({
+      orderNo: o.orderNo,
+      parts: o.parts.map((p) => ({
+        name: p.name,
+        width: Number(p.width),
+        height: Number(p.height),
+        quantity: Number(p.quantity),
+      })),
+    })),
+  });
 
   const submit = async (e) => {
     e.preventDefault();
     setError('');
     setResult(null);
+    resetRecut();
     setLoading(true);
     try {
       const res = await fetch('/api/cut', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          boardWidth: Number(boardWidth),
-          boardHeight: Number(boardHeight),
-          kerf: kerf === '' ? 0 : Number(kerf),
-          boardPrice: boardPrice === '' ? 0 : Number(boardPrice),
-          orders: orders.map((o) => ({
-            orderNo: o.orderNo,
-            parts: o.parts.map((p) => ({
-              name: p.name,
-              width: Number(p.width),
-              height: Number(p.height),
-              quantity: Number(p.quantity),
-            })),
-          })),
-        }),
+        body: JSON.stringify(currentPayload()),
       });
       const data = await res.json();
       if (!res.ok || !data.ok) {
@@ -110,11 +128,55 @@ export default function App() {
     }
   };
 
+  // ---- 缺件补切 ----
+  const toggleDamaged = (key) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  };
+
+  const submitRecut = async () => {
+    if (!result || selected.size === 0) return;
+    setRecutError('');
+    setRecut(null);
+    setRecutLoading(true);
+    // 按分单取件清单顺序收集选中的损坏件（三元身份）
+    const damaged = [];
+    for (const pl of result.pickList) {
+      for (const it of pl.items) {
+        if (selected.has(itemKey(pl.order, it.part, it.index))) {
+          damaged.push({ order: pl.order, part: it.part, index: it.index });
+        }
+      }
+    }
+    try {
+      // 提交时以当前排料输入为准，后端重新计算原方案并校验所选件
+      const res = await fetch('/api/recut', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...currentPayload(), damaged }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) {
+        setRecutError(data.error || '补切计算失败，请检查所选损坏件');
+      } else {
+        setRecut(data.result.recut);
+      }
+    } catch (err) {
+      setRecutError('无法连接排料服务，请确认后端已启动');
+    } finally {
+      setRecutLoading(false);
+    }
+  };
+
   return (
     <div className="page">
       <header className="site-header">
         <h1>矩形板材下料 · 多订单拼版断头切割排料</h1>
-        <p>多张订单混合拼版：按订单与零件行顺序断头切割，结果保留订单归属，按单取件并分摊材料费</p>
+        <p>多张订单混合拼版：按订单与零件行顺序断头切割，结果保留订单归属，按单取件并分摊材料费；损坏件可勾选后生成独立补切方案</p>
       </header>
 
       <main className="layout">
@@ -154,7 +216,7 @@ export default function App() {
             </div>
             <p className="hint">
               订单号在本次任务中唯一（留空自动编号）；同一订单内零件名不可重复，
-              <b>不同订单允许同名零件</b>。严格按订单顺序、订单内零件行顺序切割，不做大小重排。
+              <b>不同订单允许使用同名零件</b>。严格按订单顺序、订单内零件行顺序切割，不做大小重排。
             </p>
 
             <div className="orders-list">
@@ -222,22 +284,34 @@ export default function App() {
                 <li>逐板裁切图、零件落位表与刀序继续可用，色块左上角标注订单号</li>
                 <li>结果按订单列出跨板件号、所在板号与坐标，方便分单取件</li>
                 <li>每板材料费按订单零件面积比例分摊（最大余数法分配分位尾差）</li>
+                <li>在分单取件清单勾选损坏件，可生成独立的缺件补切方案</li>
               </ul>
             </div>
           )}
 
-          {result && <ResultView result={result} />}
+          {result && (
+            <>
+              <ResultView result={result} selected={selected} onToggleDamaged={toggleDamaged} />
+              <RecutSection
+                selectedCount={selected.size}
+                recut={recut}
+                error={recutError}
+                loading={recutLoading}
+                onSubmit={submitRecut}
+              />
+            </>
+          )}
         </section>
       </main>
 
       <footer className="site-footer">
-        断头切割规则：每一刀都贯穿当前所在矩形区域 · 允许零件旋转 90° · 按订单与零件行固定顺序排料
+        断头切割规则：每一刀都贯穿当前所在矩形区域 · 允许零件旋转 90° · 按订单与零件行固定顺序排料 · 补切仅重排所选损坏件，原方案不变
       </footer>
     </div>
   );
 }
 
-function ResultView({ result }) {
+function ResultView({ result, selected, onToggleDamaged }) {
   return (
     <>
       <h2>排料结果</h2>
@@ -258,6 +332,7 @@ function ResultView({ result }) {
 
       {/* 分单取件 */}
       <h2 className="section-title">分单取件清单</h2>
+      <p className="hint">勾选「补切」列标记损坏件（按订单号 + 零件名 + 件号区分），然后在页面底部生成补切方案。</p>
       <div className="pick-list">
         {result.pickList.map((pl) => {
           const summary = result.orders.find((o) => o.order === pl.order);
@@ -278,20 +353,33 @@ function ResultView({ result }) {
               <table className="detail-table pick-table">
                 <thead>
                   <tr>
-                    <th>零件件号</th><th>所在板号</th><th>位置 x,y</th>
+                    <th className="sel-col">补切</th><th>零件件号</th><th>所在板号</th><th>位置 x,y</th>
                     <th>占位 长×宽</th><th>旋转</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {pl.items.map((it, i) => (
-                    <tr key={i} className={i > 0 && it.board !== pl.items[i - 1].board ? 'board-start' : ''}>
-                      <td>{it.part} #{it.index}</td>
-                      <td><span className="board-num">{it.board}</span></td>
-                      <td>{strip(it.x)}, {strip(it.y)}</td>
-                      <td>{strip(it.w)} × {strip(it.h)}</td>
-                      <td>{it.rotated ? '是' : '否'}</td>
-                    </tr>
-                  ))}
+                  {pl.items.map((it, i) => {
+                    const key = itemKey(pl.order, it.part, it.index);
+                    const checked = selected.has(key);
+                    return (
+                      <tr key={i}
+                        className={`${i > 0 && it.board !== pl.items[i - 1].board ? 'board-start' : ''} ${checked ? 'row-selected' : ''}`}>
+                        <td className="sel-col">
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={() => onToggleDamaged(key)}
+                            title="标记为损坏件，纳入补切"
+                          />
+                        </td>
+                        <td>{it.part} #{it.index}</td>
+                        <td><span className="board-num">{it.board}</span></td>
+                        <td>{strip(it.x)}, {strip(it.y)}</td>
+                        <td>{strip(it.w)} × {strip(it.h)}</td>
+                        <td>{it.rotated ? '是' : '否'}</td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
@@ -416,6 +504,187 @@ function ResultView({ result }) {
         </div>
       ))}
     </>
+  );
+}
+
+/**
+ * 缺件补切区块：提交选中损坏件 → 展示补切清单（原板号 → 新板号）、
+ * 新增板数与材料费、补切板图与刀序。原方案落位与分摊不受影响。
+ */
+function RecutSection({ selectedCount, recut, error, loading, onSubmit }) {
+  return (
+    <div className="recut-section">
+      <h2 className="section-title">缺件补切</h2>
+      <p className="hint">
+        在上方「分单取件清单」勾选损坏件（按订单号 + 零件名 + 件号三元身份区分，跨订单同名零件互不影响）。
+        提交时以当前排料输入重新计算原方案并校验所选件；仅所选件按原始尺寸与原输入顺序
+        合并重排为独立补切方案，<b>原方案落位与材料费分摊保持不变</b>。
+      </p>
+      <button
+        type="button"
+        className="btn primary"
+        disabled={selectedCount === 0 || loading}
+        onClick={onSubmit}
+      >
+        {loading ? '正在计算补切方案…' : `生成补切方案（已选 ${selectedCount} 件）`}
+      </button>
+
+      {error && (
+        <div className="alert" role="alert">
+          <strong>无法补切：</strong>{error}
+        </div>
+      )}
+
+      {recut && <RecutResult recut={recut} />}
+    </div>
+  );
+}
+
+function RecutResult({ recut }) {
+  return (
+    <div className="recut-result">
+      <div className="stat-grid">
+        <div className="stat"><b>{recut.damagedCount}</b><span>补切件数</span></div>
+        <div className="stat accent"><b>{recut.addedBoards}</b><span>新增板数</span></div>
+        <div className="stat accent"><b>¥{yuan(recut.addedMaterialCents)}</b><span>新增材料费</span></div>
+        <div className="stat"><b>{fmt(recut.partsArea)}</b><span>补切零件面积</span></div>
+        <div className="stat"><b>{recut.utilization}%</b><span>补切利用率</span></div>
+      </div>
+
+      {/* 补切清单：逐件关联原板号与新板号 */}
+      <h3 className="recut-subtitle">补切清单（逐件关联原板号 → 新板号）</h3>
+      <table className="detail-table">
+        <thead>
+          <tr>
+            <th>订单</th><th>零件件号</th><th>原板号</th><th>新板号</th>
+            <th>位置 x,y</th><th>占位 长×宽</th><th>旋转</th>
+          </tr>
+        </thead>
+        <tbody>
+          {recut.items.map((it, i) => (
+            <tr key={i} className={i > 0 && it.board !== recut.items[i - 1].board ? 'board-start' : ''}>
+              <td>{it.order}</td>
+              <td>{it.part} #{it.index}</td>
+              <td><span className="board-num old">{it.srcBoard}</span></td>
+              <td><span className="board-num">{it.board}</span></td>
+              <td>{strip(it.x)}, {strip(it.y)}</td>
+              <td>{strip(it.w)} × {strip(it.h)}</td>
+              <td>{it.rotated ? '是' : '否'}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+
+      {/* 补切材料费按订单分摊 */}
+      {recut.orders.length > 0 && (
+        <>
+          <h3 className="recut-subtitle">补切材料费分摊</h3>
+          <table className="detail-table">
+            <thead>
+              <tr><th>订单号</th><th>补切件数</th><th>零件面积</th><th>所在新板号</th><th>分摊（元）</th></tr>
+            </thead>
+            <tbody>
+              {recut.orders.map((o) => (
+                <tr key={o.order}>
+                  <td>{o.order}</td>
+                  <td>{o.partsCount}</td>
+                  <td>{fmt(o.partsArea)}</td>
+                  <td>{o.boardIndices.join('、')}</td>
+                  <td>¥{yuan(o.materialCents)}</td>
+                </tr>
+              ))}
+              <tr className="sum-row">
+                <td>合计</td>
+                <td>{recut.damagedCount}</td>
+                <td>{fmt(recut.partsArea)}</td>
+                <td>{recut.addedBoards} 张新板</td>
+                <td>¥{yuan(recut.addedMaterialCents)}</td>
+              </tr>
+            </tbody>
+          </table>
+        </>
+      )}
+
+      {/* 补切板图与刀序 */}
+      {recut.boards.map((b) => (
+        <div className="board-card recut-board" key={b.index}>
+          <h3>
+            补切新板 第 {b.index} 张 / 共 {recut.addedBoards} 张
+            <span className="board-price">板价 ¥{yuan(b.cost.priceCents)}</span>
+          </h3>
+          <BoardDiagram board={b} boardWidth={recut.boardWidth} boardHeight={recut.boardHeight} />
+          <div className="board-stats">
+            <span>零件 {fmt(b.partsArea)}</span>
+            <span>锯缝 {fmt(b.kerfArea)}</span>
+            <span>余料 {fmt(b.remainderArea)}</span>
+            <span>利用率 {b.utilization}%</span>
+            <span>{b.cuts.length} 刀</span>
+          </div>
+
+          {b.cost.shares.length > 0 && (
+            <table className="detail-table cost-table">
+              <thead>
+                <tr><th>本板材料费分摊</th><th>零件面积</th><th>面积占比</th><th>分摊额（元）</th></tr>
+              </thead>
+              <tbody>
+                {b.cost.shares.map((s) => (
+                  <tr key={s.order}>
+                    <td>订单 {s.order}</td>
+                    <td>{fmt(s.area)}</td>
+                    <td>{s.ratio}%</td>
+                    <td>¥{yuan(s.cents)}</td>
+                  </tr>
+                ))}
+                <tr className="sum-row">
+                  <td>合计</td>
+                  <td>{fmt(b.partsArea)}</td>
+                  <td>100%</td>
+                  <td>¥{yuan(b.cost.priceCents)}</td>
+                </tr>
+              </tbody>
+            </table>
+          )}
+
+          <details>
+            <summary>查看补切落位与切割次序明细</summary>
+            <table className="detail-table">
+              <thead>
+                <tr><th>订单</th><th>零件</th><th>件号</th><th>原板号</th><th>位置 x,y</th><th>占位 长×宽</th><th>旋转</th></tr>
+              </thead>
+              <tbody>
+                {b.placements.map((p, i) => (
+                  <tr key={i}>
+                    <td>{p.order}</td>
+                    <td>{p.part}</td>
+                    <td>#{p.index}</td>
+                    <td>{p.srcBoard}</td>
+                    <td>{strip(p.x)}, {strip(p.y)}</td>
+                    <td>{strip(p.w)} × {strip(p.h)}</td>
+                    <td>{p.rotated ? '是' : '否'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <table className="detail-table">
+              <thead>
+                <tr><th>刀序</th><th>方向</th><th>起点 x1,y1</th><th>终点 x2,y2</th><th>贯穿长度</th></tr>
+              </thead>
+              <tbody>
+                {b.cuts.map((c) => (
+                  <tr key={c.seq}>
+                    <td>{c.seq}</td>
+                    <td>{c.type === 'v' ? '竖切' : '横切'}</td>
+                    <td>{strip(c.x1)}, {strip(c.y1)}</td>
+                    <td>{strip(c.x2)}, {strip(c.y2)}</td>
+                    <td>{strip(c.length)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </details>
+        </div>
+      ))}
+    </div>
   );
 }
 

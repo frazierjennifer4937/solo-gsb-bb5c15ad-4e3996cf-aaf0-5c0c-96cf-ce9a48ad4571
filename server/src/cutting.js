@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * 断头切割 (guillotine cut) 排料算法 —— 多订单拼版
+ * 断头切割 (guillotine cut) 排料算法 —— 多订单拼版 & 缺件补切
  *
  * 规则：
  *  - 坐标原点在左上角，x 向右、y 向下，单位与输入一致（通常为 mm）。
@@ -21,6 +21,14 @@
  *  - 每张板按“各订单在该板上的零件实际面积”比例分摊该板板价：
  *    先各订单取 floor（分），尾差按最大余数法逐分补入；余数相同按订单输入顺序。
  *  - 因此每板各订单分摊额之和严格等于该板板价，订单汇总严格等于总板价。
+ *
+ * 缺件补切（recutBoards）：
+ *  - 以当前排料输入重新计算原方案（落位与分摊保持原样输出，不受补切影响）；
+ *  - 按“订单号 + 零件名 + 件号”三元身份选择损坏件（跨订单同名零件互不影响），
+ *    校验所选件存在且无重复；
+ *  - 仅将所选件按原始尺寸与原输入顺序（订单 → 零件行 → 件号）合并，
+ *    重排为独立的补切方案（新增板单独计费），不改动原方案任何落位；
+ *  - 补切清单逐件关联原板号与新板号，并给出新增板数与新增材料费。
  */
 
 const EPS = 1e-9;
@@ -217,16 +225,11 @@ function apportionBoardCost(priceCents, entries) {
 }
 
 /**
- * 主入口。
- * 多订单输入：
- *   {
- *     boardWidth, boardHeight, kerf, boardPrice,
- *     orders: [{ orderNo, parts: [{ name, width, height, quantity }] }]
- *   }
- * 兼容旧版单订单输入（顶层 parts，无 orders）：整体视为一个订单。
- * 返回逐板裁切方案与按订单的取件清单 / 材料费分摊；输入不合法时抛 UserError。
+ * 解析并校验排料输入（多订单 / 旧版单订单），返回归一化参数与展平的零件行。
+ * groups：[{ order, seq(订单顺序), name, width, height, quantity }]，按输入顺序排列；
+ * ordersList：[{ order, seq }]，按订单输入顺序去重。
  */
-function cutBoards(input) {
+function parseInput(input) {
   if (!input || typeof input !== 'object') {
     throw new UserError('请求体格式不正确');
   }
@@ -260,6 +263,7 @@ function cutBoards(input) {
 
   // 展平后的排料序列：[{ order, seq(订单顺序), name, width, height, quantity }]
   const groups = [];
+  const ordersList = [];
   const usedOrderNos = new Set();
   let totalRows = 0;
   let totalQty = 0;
@@ -275,6 +279,7 @@ function cutBoards(input) {
       throw new UserError(`订单号重复：${orderNo}`);
     }
     usedOrderNos.add(orderNo);
+    ordersList.push({ order: orderNo, seq: oi });
 
     const rawParts = Array.isArray(o.parts) ? o.parts : [];
     if (rawParts.length === 0) {
@@ -322,9 +327,26 @@ function cutBoards(input) {
     });
   });
 
+  return {
+    boardWidth,
+    boardHeight,
+    kerf,
+    boardPriceCents,
+    groups,
+    ordersList,
+    totalQty,
+    legacy: !Array.isArray(input.orders),
+  };
+}
+
+/**
+ * 核心排料：按 groups 顺序（订单 → 零件行 → 数量）逐件断头切割落料。
+ * 每个 group 可带 tag = { index, srcBoard }（缺件补切场景）：
+ * 落位件号取 tag.index（原件号），并在落位上记录 srcBoard（原板号）。
+ */
+function layoutParts(boardWidth, boardHeight, kerf, groups) {
   const boards = [];
 
-  // 按订单 → 零件行 → 数量的固定输入顺序逐件排料
   for (const part of groups) {
     for (let q = 1; q <= part.quantity; q++) {
       const orientations = [{ w: part.width, h: part.height, rotated: false }];
@@ -403,12 +425,13 @@ function cutBoards(input) {
       board.placements.push({
         order: part.order,
         part: part.name,
-        index: q,
+        index: part.tag ? part.tag.index : q,
         x: fr.x,
         y: fr.y,
         w,
         h,
         rotated: ori.rotated,
+        ...(part.tag && part.tag.srcBoard !== undefined ? { srcBoard: part.tag.srcBoard } : {}),
       });
       board.partsArea += area;
       board.orderAreas.set(part.order, (board.orderAreas.get(part.order) || 0) + area);
@@ -420,25 +443,23 @@ function cutBoards(input) {
     }
   }
 
-  // 输出整理：编号、端点坐标、面积统计、逐板材料费分摊
-  const r = (v) => Math.abs(v) < EPS ? 0 : Math.round(v * 1000) / 1000;
+  return boards;
+}
 
-  // 订单汇总（按订单输入顺序）与订单顺序索引
-  const orderSeq = new Map();
-  rawOrders.forEach((o, oi) => {
-    const orderNo = (o.orderNo === undefined || o.orderNo === null || String(o.orderNo).trim() === '')
-      ? `订单${oi + 1}`
-      : String(o.orderNo).trim();
-    orderSeq.set(orderNo, oi);
-  });
+// 输出统一保留 3 位小数，0 归一
+const round3 = (v) => Math.abs(v) < EPS ? 0 : Math.round(v * 1000) / 1000;
 
+/**
+ * 输出整理：逐板编号、刀路端点、面积统计与逐板材料费分摊（最大余数法），
+ * 同时按订单汇总件数 / 面积 / 分摊额 / 所在板号。
+ * ordersList：[{ order, seq }]，决定汇总与分摊的订单顺序。
+ */
+function summarizeBoards(boards, boardPriceCents, ordersList) {
+  const orderSeq = new Map(ordersList.map((o) => [o.order, o.seq]));
   const orderSummary = new Map();
-  rawOrders.forEach((o, oi) => {
-    const orderNo = (o.orderNo === undefined || o.orderNo === null || String(o.orderNo).trim() === '')
-      ? `订单${oi + 1}`
-      : String(o.orderNo).trim();
-    orderSummary.set(orderNo, {
-      order: orderNo,
+  ordersList.forEach((o) => {
+    orderSummary.set(o.order, {
+      order: o.order,
       partsArea: 0,
       partsCount: 0,
       materialCents: 0,
@@ -450,13 +471,13 @@ function cutBoards(input) {
     const cuts = b.cuts.map((c, i) => {
       const seq = i + 1;
       const { band } = c;
-      const base = { seq, type: c.type, band: { x: r(band.x), y: r(band.y), w: r(band.w), h: r(band.h) } };
+      const base = { seq, type: c.type, band: { x: round3(band.x), y: round3(band.y), w: round3(band.w), h: round3(band.h) } };
       if (c.type === 'v') {
         const cx = band.x + band.w / 2;
-        return { ...base, x1: r(cx), y1: r(band.y), x2: r(cx), y2: r(band.y + band.h), length: r(band.h) };
+        return { ...base, x1: round3(cx), y1: round3(band.y), x2: round3(cx), y2: round3(band.y + band.h), length: round3(band.h) };
       }
       const cy = band.y + band.h / 2;
-      return { ...base, x1: r(band.x), y1: r(cy), x2: r(band.x + band.w), y2: r(cy), length: r(band.w) };
+      return { ...base, x1: round3(band.x), y1: round3(cy), x2: round3(band.x + band.w), y2: round3(cy), length: round3(band.w) };
     });
 
     const boardArea = b.width * b.height;
@@ -478,7 +499,7 @@ function cutBoards(input) {
       summary.boardIndices.add(bi + 1);
       return {
         order: s.order,
-        area: r(s.area),
+        area: round3(s.area),
         ratio: s.ratio,
         cents: s.cents,
       };
@@ -490,22 +511,23 @@ function cutBoards(input) {
 
     return {
       index: bi + 1,
-      width: r(b.width),
-      height: r(b.height),
+      width: round3(b.width),
+      height: round3(b.height),
       placements: b.placements.map((p) => ({
         order: p.order,
         part: p.part,
         index: p.index,
-        x: r(p.x),
-        y: r(p.y),
-        w: r(p.w),
-        h: r(p.h),
+        x: round3(p.x),
+        y: round3(p.y),
+        w: round3(p.w),
+        h: round3(p.h),
         rotated: p.rotated,
+        ...(p.srcBoard !== undefined ? { srcBoard: p.srcBoard } : {}),
       })),
       cuts,
-      partsArea: r(b.partsArea),
-      kerfArea: r(b.kerfArea),
-      remainderArea: r(remainderArea),
+      partsArea: round3(b.partsArea),
+      kerfArea: round3(b.kerfArea),
+      remainderArea: round3(remainderArea),
       utilization: Math.round((b.partsArea / boardArea) * 1000) / 10,
       cost: {
         priceCents: boardPriceCents,
@@ -513,6 +535,39 @@ function cutBoards(input) {
       },
     };
   });
+
+  return { resultBoards, orderSummary };
+}
+
+/**
+ * 订单汇总行（按订单输入顺序）：件数、面积、分摊额（分）、所在板号（升序去重）。
+ */
+function orderSummaryRows(orderSummary) {
+  return [...orderSummary.values()].map((s) => ({
+    order: s.order,
+    partsCount: s.partsCount,
+    partsArea: round3(s.partsArea),
+    materialCents: s.materialCents,
+    boardIndices: [...s.boardIndices].sort((a, b) => a - b),
+  }));
+}
+
+/**
+ * 多订单拼版主入口。
+ * 多订单输入：
+ *   {
+ *     boardWidth, boardHeight, kerf, boardPrice,
+ *     orders: [{ orderNo, parts: [{ name, width, height, quantity }] }]
+ *   }
+ * 兼容旧版单订单输入（顶层 parts，无 orders）：整体视为一个订单。
+ * 返回逐板裁切方案与按订单的取件清单 / 材料费分摊；输入不合法时抛 UserError。
+ */
+function cutBoards(input) {
+  const parsed = parseInput(input);
+  const { boardWidth, boardHeight, kerf, boardPriceCents } = parsed;
+
+  const boards = layoutParts(boardWidth, boardHeight, kerf, parsed.groups);
+  const { resultBoards, orderSummary } = summarizeBoards(boards, boardPriceCents, parsed.ordersList);
 
   // 分单取件清单：按订单输入顺序，件内按零件行 / 件号（即切割输入顺序）
   const pickList = [...orderSummary.values()].map((summary) => {
@@ -537,13 +592,7 @@ function cutBoards(input) {
     return { order: summary.order, items };
   });
 
-  const orders = [...orderSummary.values()].map((s) => ({
-    order: s.order,
-    partsCount: s.partsCount,
-    partsArea: r(s.partsArea),
-    materialCents: s.materialCents,
-    boardIndices: [...s.boardIndices].sort((a, b2) => a - b2),
-  }));
+  const orders = orderSummaryRows(orderSummary);
 
   const totalArea = boards.length * boardWidth * boardHeight;
   const partsArea = resultBoards.reduce((s, b) => s + b.partsArea, 0);
@@ -552,17 +601,17 @@ function cutBoards(input) {
   const totalMaterialCents = boards.length * boardPriceCents;
 
   return {
-    mode: rawOrders.length === 1 && !Array.isArray(input.orders) ? 'single' : 'orders',
-    boardWidth: r(boardWidth),
-    boardHeight: r(boardHeight),
-    kerf: r(kerf),
-    boardPrice: r(boardPriceCents / 100),
+    mode: parsed.legacy ? 'single' : 'orders',
+    boardWidth: round3(boardWidth),
+    boardHeight: round3(boardHeight),
+    kerf: round3(kerf),
+    boardPrice: round3(boardPriceCents / 100),
     boardsCount: boards.length,
-    totalParts: totalQty,
-    totalArea: r(totalArea),
-    partsArea: r(partsArea),
-    kerfArea: r(kerfArea),
-    remainderArea: r(remainderArea),
+    totalParts: parsed.totalQty,
+    totalArea: round3(totalArea),
+    partsArea: round3(partsArea),
+    kerfArea: round3(kerfArea),
+    remainderArea: round3(remainderArea),
     utilization: Math.round((partsArea / totalArea) * 1000) / 10,
     totalMaterialCents,
     orders,
@@ -571,4 +620,167 @@ function cutBoards(input) {
   };
 }
 
-module.exports = { cutBoards, UserError };
+/**
+ * 缺件补切。
+ * 输入 = 排料输入（同 cutBoards）+ damaged: [{ order, part, index }]，
+ * 以“订单号 + 零件名 + 件号”三元身份标识损坏件（跨订单同名零件互不影响）。
+ *
+ * 流程：以当前排料输入重新计算原方案 → 校验所选件存在且无重复 →
+ * 仅将所选件按原始尺寸与原输入顺序（订单 → 零件行 → 件号）合并，
+ * 重排为独立的补切方案；原方案落位与材料费分摊保持不变。
+ *
+ * 返回 { original, recut }：
+ *  - original：与 cutBoards 完全相同的原方案输出；
+ *  - recut.items：补切清单，逐件关联原板号（srcBoard）与新板号（board）；
+ *  - recut.addedBoards / addedMaterialCents：新增板数与新增材料费（分）；
+ *  - recut.boards：补切新板的落位、刀序与逐板分摊。
+ */
+function recutBoards(input) {
+  if (!input || typeof input !== 'object') {
+    throw new UserError('请求体格式不正确');
+  }
+  const parsed = parseInput(input);
+  const { boardWidth, boardHeight, kerf, boardPriceCents } = parsed;
+
+  // 以当前排料输入重新计算原方案（原样输出，落位与分摊不受补切影响）
+  const original = cutBoards(input);
+
+  // ---- 校验损坏件选择 ----
+  const damaged = input.damaged;
+  if (!Array.isArray(damaged) || damaged.length === 0) {
+    throw new UserError('请至少选择一件需要补切的损坏件');
+  }
+  if (damaged.length > 1000) {
+    throw new UserError('单次补切件数过多（最多 1000 件）');
+  }
+
+  // 零件行索引：订单号 + 零件名 → 原始尺寸 / 数量 / 输入顺序
+  const lineMap = new Map();
+  parsed.groups.forEach((g, pos) => {
+    lineMap.set(JSON.stringify([g.order, g.name]), {
+      width: g.width,
+      height: g.height,
+      quantity: g.quantity,
+      pos,
+      orderSeq: g.seq,
+    });
+  });
+
+  // 原方案落位索引：订单号 + 零件名 + 件号 → 原板号
+  const placedBoard = new Map();
+  for (const b of original.boards) {
+    for (const p of b.placements) {
+      placedBoard.set(JSON.stringify([p.order, p.part, p.index]), b.index);
+    }
+  }
+
+  const seen = new Set();
+  const selected = [];
+  damaged.forEach((d, i) => {
+    if (!d || typeof d !== 'object') {
+      throw new UserError(`第 ${i + 1} 条损坏件格式不正确`);
+    }
+    const order = d.order === undefined || d.order === null ? '' : String(d.order).trim();
+    const part = d.part === undefined || d.part === null ? '' : String(d.part).trim();
+    if (!order) throw new UserError(`第 ${i + 1} 条损坏件缺少订单号`);
+    if (!part) throw new UserError(`第 ${i + 1} 条损坏件缺少零件名`);
+    const index = Number(d.index);
+    if (!Number.isInteger(index) || index < 1) {
+      throw new UserError(`损坏件「${order} / ${part}」的件号必须是不小于 1 的整数`);
+    }
+    const key = JSON.stringify([order, part, index]);
+    if (seen.has(key)) {
+      throw new UserError(`损坏件重复选择：订单「${order}」零件「${part}」第 ${index} 件`);
+    }
+    seen.add(key);
+    const line = lineMap.get(JSON.stringify([order, part]));
+    const srcBoard = placedBoard.get(key);
+    if (!line || index > line.quantity || srcBoard === undefined) {
+      throw new UserError(`损坏件不存在：订单「${order}」零件「${part}」第 ${index} 件`);
+    }
+    selected.push({
+      order,
+      part,
+      index,
+      width: line.width,
+      height: line.height,
+      pos: line.pos,
+      orderSeq: line.orderSeq,
+      srcBoard,
+    });
+  });
+
+  // 按原输入顺序（订单 → 零件行 → 件号）排序后合并重排
+  selected.sort((a, b) => (a.pos - b.pos) || (a.index - b.index));
+
+  // 每件独立成行（保留三元身份：订单归属、原件号、原板号），按原始尺寸排料
+  const recutGroups = selected.map((s) => ({
+    order: s.order,
+    seq: s.orderSeq,
+    name: s.part,
+    width: s.width,
+    height: s.height,
+    quantity: 1,
+    tag: { index: s.index, srcBoard: s.srcBoard },
+  }));
+
+  const boards = layoutParts(boardWidth, boardHeight, kerf, recutGroups);
+
+  // 补切订单汇总仅含涉及订单，顺序仍按原订单输入顺序
+  const recutOrdersList = [];
+  const seenOrders = new Set();
+  for (const s of selected) {
+    if (!seenOrders.has(s.order)) {
+      seenOrders.add(s.order);
+      recutOrdersList.push({ order: s.order, seq: s.orderSeq });
+    }
+  }
+  const { resultBoards, orderSummary } = summarizeBoards(boards, boardPriceCents, recutOrdersList);
+
+  // 补切清单：逐件关联原板号与新板号（新板号升序，同板按落料顺序）
+  const items = [];
+  for (const b of resultBoards) {
+    for (const p of b.placements) {
+      items.push({
+        order: p.order,
+        part: p.part,
+        index: p.index,
+        srcBoard: p.srcBoard,
+        board: b.index,
+        x: p.x,
+        y: p.y,
+        w: p.w,
+        h: p.h,
+        rotated: p.rotated,
+      });
+    }
+  }
+
+  const addedBoards = resultBoards.length;
+  const addedMaterialCents = addedBoards * boardPriceCents;
+  const totalArea = addedBoards * boardWidth * boardHeight;
+  const partsArea = resultBoards.reduce((s, b) => s + b.partsArea, 0);
+  const kerfArea = resultBoards.reduce((s, b) => s + b.kerfArea, 0);
+
+  return {
+    original,
+    recut: {
+      boardWidth: round3(boardWidth),
+      boardHeight: round3(boardHeight),
+      kerf: round3(kerf),
+      boardPrice: round3(boardPriceCents / 100),
+      damagedCount: selected.length,
+      addedBoards,
+      addedMaterialCents,
+      partsArea: round3(partsArea),
+      kerfArea: round3(kerfArea),
+      remainderArea: round3(totalArea - partsArea - kerfArea),
+      utilization: addedBoards ? Math.round((partsArea / totalArea) * 1000) / 10 : 0,
+      items,
+      orders: orderSummaryRows(orderSummary),
+      boards: resultBoards,
+    },
+  };
+}
+
+module.exports = { cutBoards, recutBoards, UserError };

@@ -292,6 +292,28 @@ summary { cursor: pointer; font-size: 13px; color: var(--blue); }
 }
 .cost-table { margin-top: 10px; }
 
+/* ---- 缺件补切 ---- */
+.recut-section {
+  margin-top: 26px;
+  border-top: 2px solid #f59e0b;
+  padding-top: 4px;
+}
+.recut-section .btn.primary { margin-top: 10px; }
+.recut-section .alert { margin-top: 12px; }
+.recut-result { margin-top: 14px; }
+.recut-subtitle { font-size: 14px; margin: 18px 0 6px; }
+.recut-board { border-color: #f59e0b; }
+
+.sel-col { width: 40px; text-align: center !important; }
+.sel-col input[type="checkbox"] {
+  width: 15px;
+  height: 15px;
+  cursor: pointer;
+  accent-color: var(--blue);
+}
+.pick-table tr.row-selected td { background: #fffbeb; }
+.board-num.old { background: #94a3b8; }
+
 .site-footer {
   margin-top: 22px;
   text-align: center;

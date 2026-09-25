@@ -1,7 +1,7 @@
 /* 排料算法自检：面积守恒、刀路几何、多板、旋转与报错路径 */
 'use strict';
 const assert = require('assert');
-const { cutBoards, UserError } = require('./src/cutting');
+const { cutBoards, recutBoards, UserError } = require('./src/cutting');
 
 // 1) 示例数据：面积守恒 + 基本字段
 const r = cutBoards({
@@ -231,5 +231,105 @@ const legacy = cutBoards({
 assert.strictEqual(legacy.mode, 'single');
 assert.strictEqual(legacy.boards[0].placements[0].order, '订单1');
 assert.strictEqual(legacy.boardPrice, 0);
+
+// 14) 缺件补切：原方案不变、三元身份、原输入顺序、逐件关联原/新板号
+const base = {
+  boardWidth: 1200, boardHeight: 800, kerf: 0, boardPrice: 10,
+  orders: [
+    { orderNo: 'A', parts: [{ name: '块', width: 600, height: 400, quantity: 5 }] },
+    { orderNo: 'B', parts: [{ name: '块', width: 600, height: 400, quantity: 5 }] },
+  ],
+};
+const rc = recutBoards({
+  ...base,
+  damaged: [
+    { order: 'B', part: '块', index: 2 }, // 故意乱序：应按原输入顺序重排
+    { order: 'A', part: '块', index: 5 },
+    { order: 'A', part: '块', index: 1 },
+  ],
+});
+// 原方案落位与分摊保持不变（与直接计算完全一致）
+assert.deepStrictEqual(rc.original, cutBoards(base));
+// 补切清单按原输入顺序（订单 → 零件行 → 件号）：A#1、A#5 在 B#2 之前
+assert.strictEqual(rc.recut.damagedCount, 3);
+assert.deepStrictEqual(rc.recut.items.map((it) => [it.order, it.index]), [['A', 1], ['A', 5], ['B', 2]]);
+// 逐件关联原板号与新板号（原方案：A#1 在板1，A#5、B#2 在板2；3 件合并进 1 张新板）
+assert.deepStrictEqual(rc.recut.items.map((it) => it.srcBoard), [1, 2, 2]);
+assert.deepStrictEqual(rc.recut.items.map((it) => it.board), [1, 1, 1]);
+// 新增板数与材料费
+assert.strictEqual(rc.recut.addedBoards, 1);
+assert.strictEqual(rc.recut.addedMaterialCents, 1000);
+// 补切板面积守恒、刀序连续
+for (const b of rc.recut.boards) {
+  const boardArea = b.width * b.height;
+  assert(Math.abs(boardArea - b.partsArea - b.kerfArea - b.remainderArea) < 0.01, '补切板面积不守恒');
+  b.cuts.forEach((cut, i) => assert.strictEqual(cut.seq, i + 1));
+  const ps = b.placements;
+  for (let i = 0; i < ps.length; i++) {
+    for (let j = i + 1; j < ps.length; j++) {
+      const a = ps[i], c = ps[j];
+      const overlap = a.x < c.x + c.w - 1e-6 && c.x < a.x + a.w - 1e-6 &&
+        a.y < c.y + c.h - 1e-6 && c.y < a.y + a.h - 1e-6;
+      assert(!overlap, '补切板零件重叠');
+    }
+  }
+}
+// 补切落位保留三元身份（原件号、原板号）
+assert.deepStrictEqual(rc.recut.boards[0].placements.map((p) => [p.order, p.part, p.index, p.srcBoard]),
+  [['A', '块', 1, 1], ['A', '块', 5, 2], ['B', '块', 2, 2]]);
+// 补切逐板分摊守恒 + 按订单汇总（A 两件 2/3、B 一件 1/3，尾差归余数大的 A）
+const rcShares = rc.recut.boards[0].cost.shares;
+assert.strictEqual(rcShares.reduce((s, x) => s + x.cents, 0), 1000);
+const rcA = rc.recut.orders.find((o) => o.order === 'A');
+const rcB = rc.recut.orders.find((o) => o.order === 'B');
+assert.strictEqual(rcA.partsCount, 2);
+assert.strictEqual(rcB.partsCount, 1);
+assert.strictEqual(rcA.materialCents, 667);
+assert.strictEqual(rcB.materialCents, 333);
+assert.strictEqual(rcA.materialCents + rcB.materialCents, rc.recut.addedMaterialCents);
+assert.deepStrictEqual(rcA.boardIndices, [1]);
+
+// 15) 补切多板：5 件 600×400 需要 2 张新板
+const rc2 = recutBoards({
+  ...base,
+  damaged: [1, 2, 3, 4, 5].map((i) => ({ order: 'A', part: '块', index: i })),
+});
+assert.strictEqual(rc2.recut.addedBoards, 2);
+assert.strictEqual(rc2.recut.addedMaterialCents, 2000);
+assert.deepStrictEqual(rc2.recut.items.map((it) => it.board), [1, 1, 1, 1, 2]);
+assert.deepStrictEqual(rc2.recut.items.map((it) => it.srcBoard), [1, 1, 1, 1, 2]);
+assert.deepStrictEqual(rc2.recut.items.map((it) => it.index), [1, 2, 3, 4, 5]);
+
+// 16) 跨订单同名零件按三元身份区分：只补切 B 的「块」，不涉及 A 的同名件
+const rc3 = recutBoards({ ...base, damaged: [{ order: 'B', part: '块', index: 4 }] });
+assert.strictEqual(rc3.recut.damagedCount, 1);
+assert.strictEqual(rc3.recut.items[0].order, 'B');
+assert.strictEqual(rc3.recut.items[0].srcBoard, 3); // B#4 在原方案板3
+assert.strictEqual(rc3.recut.boards[0].placements.length, 1);
+
+// 17) 补切按原始尺寸重排：原方案中被旋转的件，补切以原始尺寸重新参与排料
+const rotRc = recutBoards({
+  boardWidth: 500, boardHeight: 300, kerf: 0,
+  orders: [{ orderNo: 'R', parts: [{ name: '横条', width: 280, height: 400, quantity: 1 }] }],
+  damaged: [{ order: 'R', part: '横条', index: 1 }],
+});
+assert.strictEqual(rotRc.original.boards[0].placements[0].rotated, true);
+assert.strictEqual(rotRc.recut.items[0].rotated, true);
+assert.strictEqual(rotRc.recut.items[0].w, 400); // 原始 280×400 旋转后占位 400×280
+assert.strictEqual(rotRc.recut.items[0].h, 280);
+
+// 18) 补切校验：空选择、件不存在、重复选择、缺字段、非法件号
+assert.throws(() => recutBoards({ ...base, damaged: [] }), UserError, '空选择应报错');
+assert.throws(() => recutBoards({ ...base }), UserError, '缺少 damaged 应报错');
+assert.throws(() => recutBoards({ ...base, damaged: [{ order: 'A', part: '块', index: 99 }] }), UserError, '件号超出数量应报错');
+assert.throws(() => recutBoards({ ...base, damaged: [{ order: 'A', part: '不存在', index: 1 }] }), UserError, '零件名不存在应报错');
+assert.throws(() => recutBoards({ ...base, damaged: [{ order: 'C', part: '块', index: 1 }] }), UserError, '订单号不存在应报错');
+assert.throws(() => recutBoards({
+  ...base,
+  damaged: [{ order: 'A', part: '块', index: 1 }, { order: 'A', part: '块', index: 1 }],
+}), UserError, '重复选择应报错');
+assert.throws(() => recutBoards({ ...base, damaged: [{ order: 'A', part: '块' }] }), UserError, '缺件号应报错');
+assert.throws(() => recutBoards({ ...base, damaged: [{ order: 'A', part: '块', index: 0 }] }), UserError, '件号 0 应报错');
+assert.throws(() => recutBoards({ ...base, damaged: [{ order: '', part: '块', index: 1 }] }), UserError, '缺订单号应报错');
 
 console.log('全部算法自检通过 ✔');
