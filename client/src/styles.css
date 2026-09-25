@@ -292,6 +292,41 @@ summary { cursor: pointer; font-size: 13px; color: var(--blue); }
 }
 .cost-table { margin-top: 10px; }
 
+/* ---- 缺件补切 ---- */
+.damaged-col { width: 40px; text-align: center; }
+.damaged-col input[type="checkbox"] {
+  width: 15px;
+  height: 15px;
+  cursor: pointer;
+  accent-color: #d97706;
+}
+.pick-table tr.damaged td { background: #fff7ed; }
+.recut-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px dashed #f59e0b;
+  border-radius: 8px;
+  background: #fffbeb;
+  font-size: 13px;
+}
+.recut-bar b { color: #b45309; }
+.btn.warn { background: #d97706; border-color: #d97706; color: #fff; font-weight: 600; }
+.btn.warn:hover { background: #b45309; }
+.recut-panel {
+  margin-top: 14px;
+  border: 1px solid #fdba74;
+  border-radius: 10px;
+  padding: 12px 14px 14px;
+  background: #fffaf3;
+}
+.recut-title { margin: 0 0 8px; font-size: 15px; color: #9a3412; }
+.board-num.new { background: #047857; }
+
 .site-footer {
   margin-top: 22px;
   text-align: center;
